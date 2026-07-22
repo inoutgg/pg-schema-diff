@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
@@ -157,7 +156,7 @@ func TestValidateSchemaPartialArchivalPrefix(t *testing.T) {
 		{name: "not simple", prefix: "deleted-schema", expectError: true},
 		{name: "reserved pg", prefix: "pg", expectError: true},
 		{name: "reserved pg prefix", prefix: "pg_deleted", expectError: true},
-		{name: "too long", prefix: "abcdefghijklmnopqrstuv", expectError: true},
+		{name: "too long", prefix: "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstu", expectError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := validateSchemaPartialArchivalPrefix(tc.prefix)
@@ -222,182 +221,4 @@ func TestGenerateDoesNotTrustUnmarkedPrefixSchemas(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestGenerateCapturesGenerationTimestamp(t *testing.T) {
-	t.Parallel()
-
-	clockTime := time.Date(2026, time.July, 21, 9, 10, 11, 123456789,
-		time.FixedZone("test", -7*60*60))
-	clockReads := 0
-	var capturedOptions *planOptions
-	clockOpt := func(opts *planOptions) {
-		capturedOptions = opts
-		opts.now = func() time.Time {
-			clockReads++
-			return clockTime
-		}
-	}
-	source := fakeSchemaSource{
-		t: t,
-		expectedDeps: schemaSourcePlanDeps{
-			logger:        slog.Default(),
-			getSchemaOpts: nil,
-		},
-		snapshot: schema.SchemaSnapshot{Hash: "snapshot-hash"},
-	}
-
-	plan, err := Generate(t.Context(), source, source, WithDoNotValidatePlan(), clockOpt)
-	require.NoError(t, err)
-	require.NotNil(t, capturedOptions)
-	assert.Equal(t, 1, clockReads)
-	assert.Equal(t, clockTime.UTC(), capturedOptions.generationTimestamp)
-	assert.Equal(t, time.UTC, capturedOptions.generationTimestamp.Location())
-	assert.Empty(t, plan.CleanupStatements)
-	assert.Contains(t, plan.CurrentSchemaHash, schema.SchemaSnapshotHashV1Prefix)
-}
-
-func TestGenerateRejectsChangedExtensionOwningHiddenTableWithoutValidation(t *testing.T) {
-	t.Parallel()
-
-	extension := schema.CatalogExtensionIdentity{
-		Name: "hidden_owner", Version: "1", SchemaName: "public",
-	}
-	expectedDeps := schemaSourcePlanDeps{
-		logger:        slog.Default(),
-		getSchemaOpts: nil,
-	}
-	current := fakeSchemaSource{
-		t: t, expectedDeps: expectedDeps,
-		snapshot: schema.SchemaSnapshot{
-			Schema: schema.Schema{Extensions: []schema.Extension{{
-				SchemaQualifiedName: schema.SchemaQualifiedName{
-					SchemaName: "public", EscapedName: `"hidden_owner"`,
-				},
-				Version: extension.Version,
-			}}},
-			Inventory: schema.CatalogInventory{
-				Extensions: []schema.CatalogExtensionIdentity{extension},
-				Relations: []schema.CatalogRelation{{
-					OID: 10, SchemaName: "hidden", Name: "member", Kind: schema.RelKindOrdinaryTable,
-					Extension: &schema.CatalogExtension{Name: extension.Name, OID: 1},
-				}},
-			},
-		},
-	}
-	target := fakeSchemaSource{t: t, expectedDeps: expectedDeps}
-
-	_, err := Generate(t.Context(), current, target, WithDoNotValidatePlan())
-	require.ErrorContains(t, err, "extension owns table-like relation hidden.member")
-}
-
-func TestGenerateRunsSourceSafetyPreflightWithoutValidation(t *testing.T) {
-	t.Parallel()
-
-	expectedDeps := schemaSourcePlanDeps{
-		logger:        slog.Default(),
-		getSchemaOpts: nil,
-	}
-	current := fakeSchemaSource{
-		t: t, expectedDeps: expectedDeps,
-		snapshot: schema.SchemaSnapshot{
-			Schema: schema.Schema{Tables: []schema.Table{{
-				SchemaQualifiedName: schema.SchemaQualifiedName{
-					SchemaName: "public", EscapedName: `"archived"`,
-				},
-			}}},
-			Inventory: schema.CatalogInventory{
-				Relations: []schema.CatalogRelation{
-					{OID: 10, SchemaName: "public", Name: "archived", Kind: schema.RelKindOrdinaryTable},
-					{OID: 20, SchemaName: "excluded", Name: "dependent", Kind: schema.RelKindView},
-				},
-				Views: []schema.CatalogView{{
-					RelationOID: 20, SchemaName: "excluded", Name: "dependent", Kind: schema.RelKindView,
-				}},
-				Dependencies: []schema.CatalogDependency{{
-					Dependent: schema.CatalogDependencyObject{
-						ClassOID: pgRewriteCatalogOID, ObjectOID: 21, ObjectType: "rule",
-						Identity: "_RETURN on excluded.dependent",
-					},
-					Referenced: schema.CatalogDependencyObject{
-						ClassOID: pgClassCatalogOID, ObjectOID: 10, ObjectType: "table",
-						Identity: "public.archived",
-					},
-				}},
-			},
-		},
-	}
-	target := fakeSchemaSource{t: t, expectedDeps: expectedDeps}
-
-	_, err := Generate(t.Context(), current, target, WithDoNotValidatePlan())
-	require.ErrorContains(t, err, "unsupported catalog dependency")
-}
-
-func TestGenerateActivatesArchivedDependencyClosure(t *testing.T) {
-	t.Parallel()
-
-	expectedDeps := schemaSourcePlanDeps{
-		logger: slog.Default(), getSchemaOpts: nil,
-	}
-	current := fakeSchemaSource{
-		t: t, expectedDeps: expectedDeps,
-		snapshot: schema.SchemaSnapshot{
-			Hash: "legacy-hash",
-			Schema: schema.Schema{Tables: []schema.Table{{
-				SchemaQualifiedName: schema.SchemaQualifiedName{
-					SchemaName: "public", EscapedName: `"archived"`,
-				},
-			}}},
-			Inventory: schema.CatalogInventory{
-				Relations: []schema.CatalogRelation{{
-					OID: 10, SchemaName: "public", Name: "archived", Kind: schema.RelKindOrdinaryTable,
-				}},
-				Types: []schema.CatalogType{{
-					OID: 20, SchemaName: "public", Name: "status", Kind: schema.CatalogTypeKindEnum,
-				}},
-				Dependencies: []schema.CatalogDependency{{
-					Dependent:  closureTableAddress(10, "public", "archived"),
-					Referenced: closureAddress(pgTypeCatalogOID, 20, "public", "status", "public.status"),
-				}},
-			},
-		},
-	}
-	target := fakeSchemaSource{t: t, expectedDeps: expectedDeps}
-
-	plan, err := Generate(t.Context(), current, target, WithDoNotValidatePlan())
-	require.NoError(t, err)
-	assert.NotEmpty(t, plan.Statements)
-	assert.NotEmpty(t, plan.CleanupStatements)
-	for _, statement := range plan.Statements {
-		assert.NotContains(t, statement.DDL, "DROP TABLE")
-	}
-}
-
-func TestGenerateNeverFallsBackToPhysicalRecreation(t *testing.T) {
-	t.Parallel()
-
-	expectedDeps := schemaSourcePlanDeps{
-		logger: slog.Default(), getSchemaOpts: nil,
-	}
-	tableName := schema.SchemaQualifiedName{SchemaName: "public", EscapedName: `"recreated"`}
-	current := fakeSchemaSource{
-		t: t, expectedDeps: expectedDeps,
-		snapshot: schema.SchemaSnapshot{Schema: schema.Schema{Tables: []schema.Table{{
-			SchemaQualifiedName: tableName,
-			Columns:             []schema.Column{{Name: "id", Type: "bigint"}},
-			ReplicaIdentity:     schema.ReplicaIdentityDefault,
-		}}}},
-	}
-	target := fakeSchemaSource{
-		t: t, expectedDeps: expectedDeps,
-		snapshot: schema.SchemaSnapshot{Schema: schema.Schema{Tables: []schema.Table{{
-			SchemaQualifiedName: tableName,
-			Columns:             []schema.Column{{Name: "id", Type: "bigint"}},
-			PartitionKeyDef:     "HASH (id)",
-			ReplicaIdentity:     schema.ReplicaIdentityDefault,
-		}}}},
-	}
-
-	_, err := Generate(t.Context(), current, target, WithDoNotValidatePlan())
-	require.ErrorContains(t, err, "catalog relation identities")
 }

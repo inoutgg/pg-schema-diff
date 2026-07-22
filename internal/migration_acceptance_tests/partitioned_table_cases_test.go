@@ -249,12 +249,8 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE schema_2."FOOBAR_1" ADD CONSTRAINT foobar_1_fk FOREIGN KEY (foo) REFERENCES foobar_fk_1(foo);
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeAuthzUpdate,
-			diff.MigrationHazardTypeCorrectness,
-			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
-		},
-		newSchemaDDL: nil,
+		expectedPlanErrorContains: "cross-boundary foreign keys",
+		newSchemaDDL:              nil,
 	},
 	{
 		name: "Add and drop partitioned table (conflicting schemas)",
@@ -605,7 +601,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE foobar ADD CONSTRAINT foobar_fk FOREIGN KEY (foo, bar) REFERENCES foobar_fk(foo, bar);
 			`,
 		},
-		expectedPlanErrorContains: "persistent routine",
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Unpartitioned to partitioned and child tables already exist",
@@ -721,7 +717,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE schema_1.foobar ADD CONSTRAINT foobar_fk FOREIGN KEY (foo, bar) REFERENCES foobar_fk(foo, bar);
 			`,
 		},
-		expectedPlanErrorContains: "persistent routine",
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Partitioned to unpartitioned",
@@ -807,7 +803,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE foobar ADD CONSTRAINT foobar_fk FOREIGN KEY (foo, bar) REFERENCES foobar_fk(foo, bar);
 			`,
 		},
-		expectedPlanErrorContains: "persistent routine",
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Partitioned to unpartitioned and child tables still exist",
@@ -919,7 +915,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE foobar ADD CONSTRAINT foobar_foo_bar_fkey FOREIGN KEY (foo, bar) REFERENCES foobar_fk(foo, bar);
 			`,
 		},
-		expectedPlanErrorContains: "persistent routine",
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Adding a partition",
@@ -1120,11 +1116,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeAuthzUpdate,
-			diff.MigrationHazardTypeCorrectness,
-			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
-		},
+		expectedPlanErrorContains: "retained-parent subtree",
 	},
 	{
 		name: "Altering a partition's 'FOR VALUES' errors",
@@ -1233,11 +1225,7 @@ var partitionedTableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE foobar_1 ADD CONSTRAINT foobar_1_fk FOREIGN KEY (foo, bar) REFERENCES foobar_fk_1(foo, bar);
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeAuthzUpdate,
-			diff.MigrationHazardTypeCorrectness,
-			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Can handle scenario where partition is not attached",

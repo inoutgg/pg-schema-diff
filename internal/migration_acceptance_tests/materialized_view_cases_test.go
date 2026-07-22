@@ -269,7 +269,10 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                 GROUP BY DATE_TRUNC('month', buzz);
 			`,
 		},
-		expectedPlanErrorContains: "persistent materialized_view",
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
 	},
 	{
 		name: "Recreate materialized view due dependent table changing",
@@ -301,7 +304,10 @@ var materializedViewAcceptanceTestCases = []acceptanceTestCase{
                 GROUP BY foo;
 			`,
 		},
-		expectedPlanErrorContains: "persistent materialized_view",
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
 	},
 	{
 		name: "Recreate materialized view due to dependent column changing",

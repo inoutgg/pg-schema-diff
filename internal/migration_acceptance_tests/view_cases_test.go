@@ -269,7 +269,10 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
                 GROUP BY DATE_TRUNC('month', buzz);
 			`,
 		},
-		expectedPlanErrorContains: "persistent view",
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
 	},
 	{
 		name: "Recreate view due dependent table changing",
@@ -301,7 +304,10 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
                 GROUP BY foo;
 			`,
 		},
-		expectedPlanErrorContains: "persistent view",
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
 	},
 	{
 		name: "Recreate view due to dependent column changing",

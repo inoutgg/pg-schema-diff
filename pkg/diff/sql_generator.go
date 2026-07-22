@@ -528,12 +528,9 @@ func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff
 }
 
 type schemaSQLGenerator struct {
-	randReader        io.Reader
-	planOptions       *planOptions
-	tableDispositions tableDispositions
-	archivalGroups    []preparedArchivalGroup
-	archivalInventory schema.CatalogInventory
-	archivalIsolation archivalIsolationPlan
+	randReader      io.Reader
+	planOptions     *planOptions
+	archivalByTable map[string]archivalTablePlan
 }
 
 func newSchemaSQLGenerator(randReader io.Reader, planOpts *planOptions) *schemaSQLGenerator {
@@ -546,19 +543,7 @@ func newSchemaSQLGenerator(randReader io.Reader, planOpts *planOptions) *schemaS
 func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	tablesInNewSchemaByName := buildSchemaObjByNameMap(diff.new.Tables)
 	addedTablesByName := buildSchemaObjByNameMap(diff.tableDiffs.adds)
-	tableDispositions, err := resolveTableDispositions(
-		diff.tableDiffs.deletes, s.tableDispositions, s.archivalGroups, s.archivalInventory,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("resolving table dispositions: %w", err)
-	}
-	if err := validateReplacementAwareStage13Scope(diff, tableDispositions,
-		s.archivalGroups, s.archivalIsolation); err != nil {
-		return nil, err
-	}
-	if len(s.archivalGroups) != 0 {
-		diff = rewriteSchemaDiffForArchivalIsolation(diff, s.archivalIsolation, tableDispositions)
-	}
+	deletedTablesByName := buildSchemaObjByNameMap(diff.tableDiffs.deletes)
 
 	materializedViewsInNewSchemaByName := buildSchemaObjByNameMap(diff.new.MaterializedViews)
 	deletedMaterializedViewsByName := buildSchemaObjByNameMap(diff.materializedViewDiffs.deletes)
@@ -573,7 +558,8 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 
 	tablePartialGraph, err := generatePartialGraph(&tableSQLVertexGenerator{
 		randReader:              s.randReader,
-		tableDispositions:       tableDispositions,
+		deletedTablesByName:     deletedTablesByName,
+		archivalByTable:         s.archivalByTable,
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
 	}, diff.tableDiffs)
@@ -602,7 +588,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, attachPartitionsPartialGraph)
 
 	renameConflictingIndexesGenerator := newRenameConflictingIndexSQLVertexGenerator(
-		s.randReader, buildSchemaObjByNameMap(diff.old.Indexes), tableDispositions,
+		s.randReader, buildSchemaObjByNameMap(diff.old.Indexes), s.archivalByTable,
 	)
 	renameConflictingIndexesPartialGraph, err :=
 		generatePartialGraph(renameConflictingIndexesGenerator, diff.indexDiffs)
@@ -612,7 +598,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, renameConflictingIndexesPartialGraph)
 
 	indexGenerator := &indexSQLVertexGenerator{
-		tableDispositions:       tableDispositions,
+		deletedTablesByName:     deletedTablesByName,
 		addedTablesByName:       addedTablesByName,
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 
@@ -633,6 +619,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, indexesPartialGraph)
 
 	foreignKeyGenerator := newForeignKeyConstraintSQLVertexGenerator(diff.oldAndNew, diff.tableDiffs)
+	foreignKeyGenerator.archivalByTable = s.archivalByTable
 	fkConsPartialGraph, err := generatePartialGraph(foreignKeyGenerator, diff.foreignKeyConstraintDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving foreign key constraint diff: %w", err)
@@ -640,8 +627,9 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, fkConsPartialGraph)
 
 	sequenceGenerator := &sequenceSQLVertexGenerator{
-		tableDispositions: tableDispositions,
-		tableDiffsByName:  buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		deletedTablesByName: deletedTablesByName,
+		tableDiffsByName:    buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		archivalByTable:     s.archivalByTable,
 	}
 	sequencesPartialGraph, err := generatePartialGraph(sequenceGenerator, diff.sequenceDiffs)
 	if err != nil {
@@ -670,7 +658,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, proceduresPartialGraph)
 
-	triggerGenerator := &triggerSQLVertexGenerator{tableDispositions: tableDispositions}
+	triggerGenerator := &triggerSQLVertexGenerator{archivalByTable: s.archivalByTable}
 	triggersPartialGraph, err := generatePartialGraph(triggerGenerator, diff.triggerDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving trigger diff: %w", err)
@@ -696,18 +684,6 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 		return nil, fmt.Errorf("converting to graph: %w", err)
 	}
 
-	legacySuffix := append(enumStatements.Deletes, extensionStatements.Deletes...)
-	legacySuffix = append(legacySuffix, namedSchemaStatements.Deletes...)
-	if len(s.archivalGroups) != 0 {
-		sqlGraph, err = integrateReplacementAwareRegularGraph(
-			sqlGraph, diff, s.archivalInventory, s.archivalGroups, s.archivalIsolation,
-			tableDispositions, enumStatements, legacySuffix,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("integrating replacement-aware regular graph: %w", err)
-		}
-	}
-
 	graphStatements, err := sqlGraph.toOrderedStatements()
 	if err != nil {
 		return nil, fmt.Errorf("getting ordered statements: %w", err)
@@ -723,14 +699,12 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	statements = append(statements, namedSchemaStatements.Alters...)
 	statements = append(statements, extensionStatements.Adds...)
 	statements = append(statements, extensionStatements.Alters...)
-	if len(s.archivalGroups) == 0 {
-		statements = append(statements, enumStatements.Adds...)
-		statements = append(statements, enumStatements.Alters...)
-	}
+	statements = append(statements, enumStatements.Adds...)
+	statements = append(statements, enumStatements.Alters...)
 	statements = append(statements, graphStatements...)
-	if len(s.archivalGroups) == 0 {
-		statements = append(statements, legacySuffix...)
-	}
+	statements = append(statements, enumStatements.Deletes...)
+	statements = append(statements, extensionStatements.Deletes...)
+	statements = append(statements, namedSchemaStatements.Deletes...)
 	return statements, nil
 }
 
@@ -812,7 +786,8 @@ func buildMap[K comparable, V any](v []V, getKey func(V) K) map[K]V {
 
 type tableSQLVertexGenerator struct {
 	randReader              io.Reader
-	tableDispositions       tableDispositions
+	deletedTablesByName     map[string]schema.Table
+	archivalByTable         map[string]archivalTablePlan
 	tablesInNewSchemaByName map[string]schema.Table
 	tableDiffsByName        map[string]tableDiff
 }
@@ -832,9 +807,6 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) (partialSQLGraph, erro
 
 func (t *tableSQLVertexGenerator) addStatements(table schema.Table) ([]Statement, error) {
 	if table.IsPartition() {
-		if table.IsPartitioned() {
-			return nil, fmt.Errorf("partitioned partitions: %w", ErrNotImplemented)
-		}
 		if len(table.CheckConstraints) > 0 {
 			return nil, fmt.Errorf("check constraints on partitions: %w", ErrNotImplemented)
 		}
@@ -948,15 +920,11 @@ func (t *tableSQLVertexGenerator) Delete(table schema.Table) (partialSQLGraph, e
 }
 
 func (t *tableSQLVertexGenerator) deleteStatements(table schema.Table) ([]Statement, error) {
-	disposition, ok := t.tableDispositions[table.GetName()]
-	if !ok {
-		return nil, fmt.Errorf("missing disposition for table %s", table.GetName())
-	}
-	if disposition.Kind == tableDispositionKindArchivalMove {
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		if archival.root {
+			return []Statement{archival.group.statement}, nil
+		}
 		return nil, nil
-	}
-	if disposition.Kind != tableDispositionKindPhysicalDelete {
-		return nil, fmt.Errorf("unknown disposition %d for table %s", disposition.Kind, table.GetName())
 	}
 	if table.IsPartition() {
 		// Don't support dropping partitions without dropping the base table. This would be easy to implement, but we
@@ -964,7 +932,7 @@ func (t *tableSQLVertexGenerator) deleteStatements(table schema.Table) ([]Statem
 		//
 		// The base table might be recreated, so check if its deleted rather than just checking if it does not exist in
 		// the new schema
-		if !tableIsLogicallyRemoved(t.tableDispositions, table.ParentTable.GetName()) {
+		if _, baseTableDropped := t.deletedTablesByName[table.ParentTable.GetName()]; !baseTableDropped {
 			return nil, fmt.Errorf("deleting partitions without dropping parent table: %w", ErrNotImplemented)
 		}
 		// It will be dropped when the parent table is dropped
@@ -1233,6 +1201,15 @@ func (t *tableSQLVertexGenerator) getAddAlterDependencies(table schema.Table) []
 			buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete),
 		),
 	}
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		root := schema.SchemaQualifiedName{
+			SchemaName:  archival.group.marker.Root.Schema,
+			EscapedName: schema.EscapeIdentifier(archival.group.marker.Root.Name),
+		}
+		deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(
+			buildTableVertexId(root, diffTypeDelete),
+		))
+	}
 
 	if table.ParentTable != nil {
 		deps = append(
@@ -1304,6 +1281,24 @@ func buildTempNotNullConstraint(randReader io.Reader, colDiff columnDiff) (schem
 
 func (t *tableSQLVertexGenerator) getDeleteDependencies(table schema.Table) []dependency {
 	var deps []dependency
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		if !archival.root {
+			return nil
+		}
+		rootVertex := buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)
+		for _, member := range archival.group.members {
+			if member.name == archival.group.marker.Root {
+				continue
+			}
+			memberName := schema.SchemaQualifiedName{
+				SchemaName: member.name.Schema, EscapedName: schema.EscapeIdentifier(member.name.Name),
+			}
+			deps = append(deps, mustRun(rootVertex).after(
+				buildTableVertexId(memberName, diffTypeDelete),
+			))
+		}
+		return deps
+	}
 	if table.ParentTable != nil {
 		deps = append(
 			deps,
@@ -1619,18 +1614,18 @@ type renameConflictingIndexSQLVertexGenerator struct {
 	// It is used to identify if an index has been re-created
 	oldSchemaIndexesByName map[string]schema.Index
 	indexRenamesByOldName  map[string]string
-	tableDispositions      tableDispositions
+	archivalByTable        map[string]archivalTablePlan
 }
 
 func newRenameConflictingIndexSQLVertexGenerator(randReader io.Reader,
 	oldSchemaIndexesByName map[string]schema.Index,
-	tableDispositions tableDispositions,
+	archivalByTable map[string]archivalTablePlan,
 ) *renameConflictingIndexSQLVertexGenerator {
 	return &renameConflictingIndexSQLVertexGenerator{
 		randReader:             randReader,
 		oldSchemaIndexesByName: oldSchemaIndexesByName,
 		indexRenamesByOldName:  make(map[string]string),
-		tableDispositions:      tableDispositions,
+		archivalByTable:        archivalByTable,
 	}
 }
 
@@ -1648,13 +1643,17 @@ func (rsg *renameConflictingIndexSQLVertexGenerator) Add(index schema.Index) (pa
 }
 
 func (rsg *renameConflictingIndexSQLVertexGenerator) addStatements(index schema.Index) ([]Statement, error) {
-	if oldIndex, indexIsBeingRecreated := rsg.oldSchemaIndexesByName[index.GetName()]; !indexIsBeingRecreated {
+	oldIndex, indexIsBeingRecreated := rsg.oldSchemaIndexesByName[index.GetName()]
+	if !indexIsBeingRecreated {
 		return nil, nil
-	} else if oldIndex.OwningRelKind != schema.RelKindMaterializedView &&
-		tableIsPreserved(rsg.tableDispositions, oldIndex.OwningRelName.GetName()) {
-		// SET SCHEMA frees the old index name without rebuilding or renaming it.
-		return nil, nil
-	} else if oldIndex.IsPk() && index.IsPk() {
+	}
+	if oldIndex.OwningRelKind != schema.RelKindMaterializedView {
+		if _, archived := rsg.archivalByTable[oldIndex.OwningRelName.GetName()]; archived {
+			// SET SCHEMA frees the old index name without rebuilding or renaming it.
+			return nil, nil
+		}
+	}
+	if oldIndex.IsPk() && index.IsPk() {
 		// Don't bother renaming if both are primary keys, since the new index will need to be created after the old
 		// index because we can't have two primary keys at the same time.
 		//
@@ -1728,8 +1727,8 @@ func buildRenameConflictingIndexVertexId(indexName schema.SchemaQualifiedName, d
 }
 
 type indexSQLVertexGenerator struct {
-	// tableDispositions records how removed tables leave the ordinary schema.
-	tableDispositions tableDispositions
+	// deletedTablesByName is a map of removed tables and partitions.
+	deletedTablesByName map[string]schema.Table
 	// addedTablesByName is a map of table name to the new tables (and partitions)
 	// This is used to identify if hazards are necessary
 	addedTablesByName map[string]schema.Table
@@ -1766,7 +1765,8 @@ func (isg *indexSQLVertexGenerator) isIndexRemovalHandledByOwningRelation(index 
 		_, deleted := isg.deletedMaterializedViewsByName[index.OwningRelName.GetName()]
 		return deleted
 	default:
-		return tableIsLogicallyRemoved(isg.tableDispositions, index.OwningRelName.GetName())
+		_, deleted := isg.deletedTablesByName[index.OwningRelName.GetName()]
+		return deleted
 	}
 }
 
@@ -2591,6 +2591,7 @@ func buildForeignKeyConstraintDiff(fsg *foreignKeyConstraintSQLVertexGenerator,
 }
 
 type foreignKeyConstraintSQLVertexGenerator struct {
+	archivalByTable map[string]archivalTablePlan
 	// newSchemaTablesByName is a map of table name to tables in the new schema.
 	newSchemaTablesByName map[string]schema.Table
 	// addedTablesByName is a map of table name to the added tables
@@ -2686,6 +2687,11 @@ func (f *foreignKeyConstraintSQLVertexGenerator) Delete(con schema.ForeignKeyCon
 }
 
 func (f *foreignKeyConstraintSQLVertexGenerator) deleteStatements(con schema.ForeignKeyConstraint) []Statement {
+	owner, ownerArchived := f.archivalByTable[con.OwningTable.GetName()]
+	foreign, foreignArchived := f.archivalByTable[con.ForeignTable.GetName()]
+	if ownerArchived && foreignArchived && owner.group == foreign.group {
+		return nil
+	}
 	// Always generate a drop statement even if the owning table is being deleted. This simplifies the logic a bit because
 	// if the owning table has a circular FK dependency with another table being dropped, we will need to explicitly drop
 	// one of the FK's first
@@ -2790,8 +2796,9 @@ func (f *foreignKeyConstraintSQLVertexGenerator) getDeleteDependencies(con schem
 }
 
 type sequenceSQLVertexGenerator struct {
-	tableDispositions tableDispositions
-	tableDiffsByName  map[string]tableDiff
+	deletedTablesByName map[string]schema.Table
+	tableDiffsByName    map[string]tableDiff
+	archivalByTable     map[string]archivalTablePlan
 }
 
 func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) (partialSQLGraph, error) {
@@ -2935,15 +2942,20 @@ func (s *sequenceSQLVertexGenerator) getDeleteDependencies(seq schema.Sequence) 
 	// old owner column delete (equivalent to add/alter) and the sequence add/alter. We can get away with this because
 	// we, so far, no columns are ever "re-created". If we ever do support that, we'll need to revisit this.
 	if seq.Owner != nil {
-		deps = append(deps, mustRun(buildSequenceVertexId(seq.SchemaQualifiedName, diffTypeDelete)).after(
-			buildTableVertexId(seq.Owner.TableName, diffTypeDelete),
-		))
+		ownerDelete := buildTableVertexId(seq.Owner.TableName, diffTypeDelete)
+		if archival, ok := s.archivalByTable[seq.Owner.TableName.GetName()]; ok {
+			ownerDelete = buildTableVertexId(schema.SchemaQualifiedName{
+				SchemaName:  archival.group.marker.Root.Schema,
+				EscapedName: schema.EscapeIdentifier(archival.group.marker.Root.Name),
+			}, diffTypeDelete)
+		}
+		deps = append(deps, mustRun(buildSequenceVertexId(seq.SchemaQualifiedName, diffTypeDelete)).after(ownerDelete))
 	}
 	return deps
 }
 
 func (s *sequenceSQLVertexGenerator) isSequenceRemovalHandledByOwningTable(seq schema.Sequence) bool {
-	if tableIsLogicallyRemoved(s.tableDispositions, seq.Owner.TableName.GetName()) {
+	if _, ok := s.deletedTablesByName[seq.Owner.TableName.GetName()]; ok {
 		// Physical table deletion drops the sequence, while archival moves preserve it.
 		return true
 	}

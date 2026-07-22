@@ -1417,7 +1417,8 @@ func runTestCase(t *testing.T, factory *testdb.Factory, testCase *testCase) {
 	assert.Equal(t, expectedNormalized, fetchedNormalized, "expected=\n%# v \n fetched=%# v\n",
 		pretty.Formatter(expectedNormalized), pretty.Formatter(fetchedNormalized))
 
-	fetchedSchemaHash := snapshot.Hash
+	fetchedSchemaHash, err := snapshot.Schema.Hash()
+	require.NoError(t, err)
 	expectedSchemaHash, err := testCase.expectedSchema.Hash()
 	require.NoError(t, err)
 	// same schemas should have the same hashes

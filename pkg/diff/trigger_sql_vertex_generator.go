@@ -12,7 +12,7 @@ type triggerDiff struct {
 }
 
 type triggerSQLVertexGenerator struct {
-	tableDispositions tableDispositions
+	archivalByTable map[string]archivalTablePlan
 }
 
 func (t *triggerSQLVertexGenerator) Add(trigger schema.Trigger) (partialSQLGraph, error) {
@@ -40,7 +40,7 @@ func (t *triggerSQLVertexGenerator) Delete(trigger schema.Trigger) (partialSQLGr
 }
 
 func (t *triggerSQLVertexGenerator) deleteStatements(trigger schema.Trigger) []Statement {
-	if tableIsPreserved(t.tableDispositions, trigger.OwningTable.GetName()) {
+	if _, archived := t.archivalByTable[trigger.OwningTable.GetName()]; archived {
 		return nil
 	}
 	return []Statement{{

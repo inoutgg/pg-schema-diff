@@ -67,13 +67,9 @@ type Schema struct {
 	MaterializedViews     []MaterializedView
 }
 
-// SchemaSnapshot is the normalized modeled schema and its existing schema hash
-// from one catalog snapshot. Callers treat snapshots as immutable.
+// SchemaSnapshot contains the normalized modeled schema read from one catalog snapshot.
 type SchemaSnapshot struct {
-	Schema           Schema
-	UnfilteredSchema Schema
-	Hash             string
-	Inventory        CatalogInventory
+	Schema Schema
 }
 
 // Normalize sorts schema objects while preserving the physical order of table columns.
@@ -586,8 +582,7 @@ type getSchemaOptions struct {
 	excludeSchemaPatterns []string
 }
 
-// GetSchemaSnapshot fetches and hashes the database schema from one consistent
-// catalog snapshot.
+// GetSchemaSnapshot fetches the modeled database schema from one consistent catalog snapshot.
 func GetSchemaSnapshot(ctx context.Context, db *pgxpool.Pool, opts ...GetSchemaOpt) (SchemaSnapshot, error) {
 	nameFilter, err := getSchemaNameFilter(opts...)
 	if err != nil {
@@ -627,29 +622,11 @@ func GetSchemaSnapshot(ctx context.Context, db *pgxpool.Pool, opts ...GetSchemaO
 }
 
 func getSchemaSnapshot(ctx context.Context, db dbsqlc.DBTX, nameFilter nameFilter) (SchemaSnapshot, error) {
-	unfilteredSchema, err := (&schemaFetcher{nameFilter: func(SchemaQualifiedName) bool {
-		return true
-	}}).getSchema(ctx, db)
+	fetchedSchema, err := (&schemaFetcher{nameFilter: nameFilter}).getSchema(ctx, db)
 	if err != nil {
 		return SchemaSnapshot{}, err
 	}
-	fetchedSchema := filterSchema(*unfilteredSchema, nameFilter)
-	inventory, err := fetchCatalogInventory(ctx, db)
-	if err != nil {
-		return SchemaSnapshot{}, fmt.Errorf("fetching catalog inventory: %w", err)
-	}
-
-	normalizedSchema := fetchedSchema.Normalize()
-	normalizedUnfilteredSchema := unfilteredSchema.Normalize()
-	hash, err := normalizedSchema.Hash()
-	if err != nil {
-		return SchemaSnapshot{}, fmt.Errorf("hashing schema: %w", err)
-	}
-
-	return SchemaSnapshot{
-		Schema: normalizedSchema, UnfilteredSchema: normalizedUnfilteredSchema,
-		Hash: hash, Inventory: inventory,
-	}, nil
+	return SchemaSnapshot{Schema: fetchedSchema.Normalize()}, nil
 }
 
 func getSchemaNameFilter(opts ...GetSchemaOpt) (nameFilter, error) {

@@ -277,12 +277,16 @@ func cleanupSchemaNames(plan diff.Plan) []string {
 	var result []string
 	for _, statement := range plan.CleanupStatements {
 		const prefix = `DROP SCHEMA "`
-		const suffix = `" RESTRICT`
-		if !strings.HasPrefix(statement.DDL, prefix) ||
-			!strings.HasSuffix(statement.DDL, suffix) {
+		start := strings.Index(statement.DDL, prefix)
+		if start < 0 {
 			continue
 		}
-		name := strings.TrimSuffix(strings.TrimPrefix(statement.DDL, prefix), suffix)
+		nameStart := start + len(prefix)
+		nameEnd := strings.Index(statement.DDL[nameStart:], `" RESTRICT`)
+		if nameEnd < 0 {
+			continue
+		}
+		name := statement.DDL[nameStart : nameStart+nameEnd]
 		result = append(result, strings.ReplaceAll(name, `""`, `"`))
 	}
 	return result

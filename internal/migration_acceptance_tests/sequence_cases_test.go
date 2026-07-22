@@ -545,7 +545,6 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 		expectedHazardTypes: []diff.MigrationHazardType{
 			diff.MigrationHazardTypeAuthzUpdate,
 			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
-			diff.MigrationHazardTypeHasUntrackableDependencies,
 		},
 	},
 	{

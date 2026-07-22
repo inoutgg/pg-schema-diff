@@ -143,9 +143,9 @@ moved into uniquely named, marked archival schemas using the default
 {
   "statements": [],
   "cleanup_statements": [
-    {"ddl": "DROP TABLE ... RESTRICT", "hazards": []}
+	{"ddl": "DO ... DROP TABLE ... RESTRICT; DROP SCHEMA ... RESTRICT", "hazards": []}
   ],
-  "current_schema_hash": "pg-schema-diff:snapshot:v1:sha256:..."
+	"current_schema_hash": "pg-schema-diff:snapshot:v2:sha256:..."
 }
 ```
 
@@ -162,9 +162,11 @@ plan, err := diff.Generate(
 ```
 
 Include and exclude schema options still accumulate. Prefix-like schemas are not
-trusted by name alone: existing archival schemas must have valid markers and
-matching catalog identities and cleanup digests. Target schemas may not use the
-selected reserved archival naming grammar.
+trusted by name alone: only exact generated names with strict, consistent marker
+comments are excluded from managed diffing. Markers bind the archived root and
+partition members by OID, name, and parent edge. Cleanup locks and rechecks those
+facts before using `RESTRICT`. Target schemas may not use the selected reserved
+archival naming grammar.
 
 ## 2. Applying plan
 We leave plan application up to the user. For example, you might want to take out a session-level advisory lock if you are 
@@ -180,10 +182,10 @@ for _, stmt := range plan.Statements {
 }
 ```
 
-Apply only `plan.Statements` for the ordinary migration. This is also the
-compatibility behavior for existing plan consumers: removed rows remain retained
-and `CleanupStatements` is not applied automatically. Do not concatenate the two
-lists. Cleanup is an optional, destructive, later operation with its own hazards:
+Apply only `plan.Statements` for the ordinary migration. Removed rows remain
+retained and `CleanupStatements` is not applied automatically. Do not concatenate
+the two lists. Cleanup is an optional, destructive, later operation with its own
+hazards:
 
 ```go
 for _, stmt := range plan.CleanupStatements {
@@ -194,14 +196,14 @@ for _, stmt := range plan.CleanupStatements {
 }
 ```
 
-Ordinary archival statements can report `AUTHZ_UPDATE`, lock, and `CORRECTNESS`
-hazards. Physical table deletion and its `DELETES_DATA` hazard are confined to
+Ordinary archival statements report `AUTHZ_UPDATE` and lock hazards. Physical
+table deletion and its `DELETES_DATA` hazard are confined to
 `CleanupStatements`; standalone destructive changes such as dropping a column or
 sequence may still report `DELETES_DATA` in the ordinary list.
 
 Before applying a stored plan, compare `plan.CurrentSchemaHash` with
 `schema.GetSchemaHash`. Both use the versioned
-`pg-schema-diff:snapshot:v1:sha256:` contract. Plans generated with a custom
+`pg-schema-diff:snapshot:v2:sha256:` contract. Plans generated with a custom
 archival prefix must use the matching public helper:
 
 ```go
@@ -215,19 +217,17 @@ if err != nil || currentHash != plan.CurrentSchemaHash {
 }
 ```
 
-The v1 hash intentionally replaces the previous modeled-schema hash and is not
-compatible with stored legacy hash values. Adding `CleanupStatements` to `Plan`
-also means external unkeyed `diff.Plan{...}` literals no longer compile; use keyed
-fields.
+The v2 hash covers the modeled managed schema and the minimal markers for existing
+archive groups. It intentionally does not hash a catalog mirror.
 
-Archival supports ordinary tables, complete declarative partition trees, and
-detached declarative subtrees. It preserves supported table-local objects and
-isolates supported ACL, foreign-key, publication, and dependency boundaries.
-Traditional inheritance, foreign-table partitions, extension-owned removed
-tables, untrackable persisting routines, and dependencies that cannot be safely
-round-tripped fail closed. `WithDoNotValidatePlan` disables temporary-database
-execution only; source safety checks still run and never restore destructive table
-deletion.
+Archival supports ordinary tables and complete declarative partition trees.
+Traditional or multiple inheritance, retained-parent subtrees, foreign or
+temporary tables, cross-boundary foreign keys, publication membership, extended
+statistics, extension-owned objects, enabled event triggers, and retained
+catalog-tracked dependents fail closed. Untrackable routine bodies are not treated
+as dependencies without catalog evidence. Archival requires a live database-backed
+current source; DDL current sources remain supported when no table archival is
+needed.
 
 # Supported Postgres versions
 Supported: 14, 15, 16, 17

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -21,7 +22,7 @@ var errTempDbFactoryRequired = fmt.Errorf("tempDbFactory is required. include th
 
 const (
 	defaultSchemaPartialArchivalPrefix = schema.DefaultCleanupSchemaPrefix
-	maxSchemaPartialArchivalPrefixSize = 21
+	maxSchemaPartialArchivalPrefixSize = 46
 )
 
 type (
@@ -33,8 +34,6 @@ type (
 		randReader                  io.Reader
 		noConcurrentIndexOps        bool
 		schemaPartialArchivalPrefix string
-		now                         func() time.Time
-		generationTimestamp         time.Time
 	}
 
 	PlanOpt func(opts *planOptions)
@@ -125,12 +124,10 @@ func Generate(
 		logger:                      slog.Default(),
 		randReader:                  rand.Reader,
 		schemaPartialArchivalPrefix: defaultSchemaPartialArchivalPrefix,
-		now:                         time.Now,
 	}
 	for _, opt := range opts {
 		opt(planOptions)
 	}
-	planOptions.generationTimestamp = planOptions.now().UTC()
 	if planOptions.logger == nil {
 		planOptions.logger = slog.Default()
 	}
@@ -153,54 +150,79 @@ func Generate(
 	if err != nil {
 		return Plan{}, fmt.Errorf("getting new schema: %w", err)
 	}
-	if err := validateNoChangedExtensionOwnsTable(currentSnapshot, newSnapshot); err != nil {
+	currentFull := currentSnapshot.Schema
+	managedCurrent := currentFull
+	var currentPool *pgxpool.Pool
+	if source, ok := fromSchema.(*dbSchemaSource); ok {
+		currentPool = source.connPool
+	}
+	if err := validateChangedExtensionTableMembers(ctx, currentPool, currentFull, newSnapshot.Schema); err != nil {
+		return Plan{}, fmt.Errorf("validating changed extensions: %w", err)
+	}
+	var existingGroups []*archivalGroup
+	if currentPool != nil {
+		existingGroups, err = discoverArchivalGroups(ctx, currentPool,
+			planOptions.schemaPartialArchivalPrefix)
+		if err != nil {
+			return Plan{}, fmt.Errorf("discovering existing archival groups: %w", err)
+		}
+		var excluded []string
+		for _, group := range existingGroups {
+			excluded = append(excluded, group.marker.Schemas...)
+		}
+		managedCurrent = schema.ExcludeSchemaNames(managedCurrent, excluded)
+	}
+	if err := rejectReservedArchivalTargetSchemas(newSnapshot.Schema,
+		planOptions.schemaPartialArchivalPrefix); err != nil {
 		return Plan{}, err
 	}
-
-	archival, err := orchestrateArchivalGeneration(currentSnapshot, newSnapshot, planOptions)
+	schemaDiff, _, err := buildSchemaDiff(managedCurrent, newSnapshot.Schema)
+	if err != nil {
+		return Plan{}, fmt.Errorf("building managed schema diff: %w", err)
+	}
+	archival, err := buildArchivalPlan(ctx, currentPool, managedCurrent, newSnapshot.Schema,
+		schemaDiff.tableDiffs.deletes, existingGroups, planOptions)
 	if err != nil {
 		return Plan{}, fmt.Errorf("generating archival migration plan: %w", err)
 	}
-	currentHash, err := buildCandidatePlanSnapshotHash(archival.current, archival.sourceTrust)
+	generator := newSchemaSQLGenerator(planOptions.randReader, planOptions)
+	generator.archivalByTable = archival.byTable
+	statements, err := generator.Alter(schemaDiff)
+	if err != nil {
+		return Plan{}, fmt.Errorf("generating migration statements: %w", err)
+	}
+	currentHash, err := buildArchivalSchemaHash(managedCurrent, existingGroups)
 	if err != nil {
 		return Plan{}, fmt.Errorf("hashing current schema snapshot: %w", err)
 	}
 
 	plan := Plan{
-		Statements:        archival.statements,
-		CleanupStatements: archival.cleanup.CleanupStatements,
+		Statements:        statements,
+		CleanupStatements: archival.cleanup,
 		CurrentSchemaHash: currentHash,
-	}
-
-	archivalValidation := archivalPlanValidationRequest{
-		TempDBFactory: planOptions.tempDbFactory, Logger: planOptions.logger,
-		Prefix:          planOptions.schemaPartialArchivalPrefix,
-		CurrentSnapshot: archival.current, TargetSnapshot: archival.target,
-		OrdinaryStatements: plan.Statements, Cleanup: archival.cleanup,
-		SourcePreflight: archival.preflight, DependencyClosure: archival.dependencyClosure,
-		Isolation: archival.isolation, ManagedSchemaOptions: planOptions.getSchemaOpts,
-	}
-	if len(archival.cleanup.FinalizedMarkers) > 0 {
-		if err := validateArchivalPlanSourceFacts(archivalValidation); err != nil {
-			return Plan{}, fmt.Errorf("validating archival source safety: %w", err)
-		}
 	}
 	if planOptions.validatePlan {
 		if planOptions.tempDbFactory == nil {
 			return Plan{}, fmt.Errorf("cannot validate plan without a tempDbFactory: %w", errTempDbFactoryRequired)
 		}
-		if len(archival.cleanup.FinalizedMarkers) > 0 {
-			err = validateArchivalPlanTwoPhase(ctx, archivalValidation)
-		} else {
-			err = assertValidPlan(ctx, planOptions.tempDbFactory, archival.current.Schema,
-				archival.target.Schema, plan, planOptions)
-		}
+		err = assertValidPlan(ctx, planOptions.tempDbFactory, currentFull,
+			newSnapshot.Schema, plan, archival.excludedSchemas, archival.createdSchemas, planOptions)
 		if err != nil {
 			return Plan{}, fmt.Errorf("validating migration plan: %w \n%# v", err, pretty.Formatter(plan))
 		}
 	}
 
 	return plan, nil
+}
+
+func rejectReservedArchivalTargetSchemas(target schema.Schema, prefix string) error {
+	pattern := regexp.MustCompile(`^` + regexp.QuoteMeta(prefix) + `_[0-9a-f]{16}$`)
+	for _, named := range target.NamedSchemas {
+		if pattern.MatchString(named.Name) {
+			return fmt.Errorf("target schema %q uses a reserved generated archival name", named.Name)
+		}
+	}
+	return nil
 }
 
 func validateSchemaPartialArchivalPrefix(prefix string) error {
@@ -234,6 +256,8 @@ func assertValidPlan(ctx context.Context,
 	tempDbFactory tempdb.Factory,
 	currentSchema, newSchema schema.Schema,
 	plan Plan,
+	excludedArchiveSchemas []string,
+	createdArchiveSchemas []string,
 	planOptions *planOptions,
 ) error {
 	tempDb, err := tempDbFactory.Create(ctx)
@@ -256,12 +280,52 @@ func assertValidPlan(ctx context.Context,
 		return fmt.Errorf("running migration plan: %w", err)
 	}
 
-	migratedSchema, err := schemaFromTempDb(ctx, tempDb, planOptions)
+	validationOptions := *planOptions
+	validationOptions.getSchemaOpts = append([]schema.GetSchemaOpt{}, planOptions.getSchemaOpts...)
+	for _, name := range excludedArchiveSchemas {
+		validationOptions.getSchemaOpts = append(validationOptions.getSchemaOpts,
+			schema.WithExcludeSchemaPatterns(regexp.QuoteMeta(name)))
+	}
+	migratedSchema, err := schemaFromTempDb(ctx, tempDb, &validationOptions)
 	if err != nil {
 		return fmt.Errorf("fetching schema from migrated database: %w", err)
 	}
 
-	return assertMigratedSchemaMatchesTarget(*migratedSchema, newSchema, planOptions)
+	if err := assertMigratedSchemaMatchesTarget(*migratedSchema, newSchema, planOptions); err != nil {
+		return err
+	}
+	if len(createdArchiveSchemas) == 0 {
+		return nil
+	}
+	discovered, err := discoverArchivalGroupsBySchemaNames(
+		ctx, tempDb.ConnPool, planOptions.schemaPartialArchivalPrefix, createdArchiveSchemas,
+	)
+	if err != nil {
+		return fmt.Errorf("discovering newly created archives before cleanup validation: %w", err)
+	}
+	created := make(map[string]struct{}, len(createdArchiveSchemas))
+	for _, name := range createdArchiveSchemas {
+		created[name] = struct{}{}
+	}
+	var validationGroups []*archivalGroup
+	for _, group := range discovered {
+		if _, ok := created[group.marker.Schemas[0]]; ok {
+			validationGroups = append(validationGroups, group)
+		}
+	}
+	if len(validationGroups) != len(createdArchiveSchemas) {
+		return fmt.Errorf("discovered %d of %d newly created archive groups for cleanup validation",
+			len(validationGroups), len(createdArchiveSchemas))
+	}
+	if err := executeStatementsIgnoreTimeouts(ctx, tempDb.ConnPool,
+		renderArchivalCleanup(validationGroups)); err != nil {
+		return fmt.Errorf("running deferred cleanup plan: %w", err)
+	}
+	cleanedSchema, err := schemaFromTempDb(ctx, tempDb, &validationOptions)
+	if err != nil {
+		return fmt.Errorf("fetching schema after deferred cleanup: %w", err)
+	}
+	return assertMigratedSchemaMatchesTarget(*cleanedSchema, newSchema, planOptions)
 }
 
 func setSchemaForEmptyDatabase(ctx context.Context, emptyDb *tempdb.Database, targetSchema schema.Schema, options *planOptions) error {

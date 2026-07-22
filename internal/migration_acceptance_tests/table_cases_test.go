@@ -178,12 +178,8 @@ var tableAcceptanceTestCases = []acceptanceTestCase{
             ALTER TABLE foobar ADD CONSTRAINT foobar_fk FOREIGN KEY (foo, bar) REFERENCES schema_1.foobar_fk(foo, bar);
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeAuthzUpdate,
-			diff.MigrationHazardTypeCorrectness,
-			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
-		},
-		newSchemaDDL: nil,
+		expectedPlanErrorContains: "cross-boundary foreign keys",
+		newSchemaDDL:              nil,
 	},
 	{
 		name: "Drop a table with quoted names",

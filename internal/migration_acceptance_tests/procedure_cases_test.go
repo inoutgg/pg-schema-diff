@@ -154,7 +154,10 @@ var procedureAcceptanceTestCases = []acceptanceTestCase{
             DROP TABLE users;
 			`,
 		},
-		expectedPlanErrorContains: "persistent routine",
+		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
+		},
 		planOpts: []diff.PlanOpt{
 			// Skip plan validation because the acceptance test attempts to regenerate the plan after migrating and
 			// assert it's empty. As part of this plan regeneration, plan validation attempts to create a database with
