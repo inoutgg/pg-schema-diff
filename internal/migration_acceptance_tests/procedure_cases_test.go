@@ -124,6 +124,8 @@ var procedureAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 			diff.MigrationHazardTypeDeletesData,
 			diff.MigrationHazardTypeHasUntrackableDependencies,
 		},
@@ -153,7 +155,8 @@ var procedureAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 		planOpts: []diff.PlanOpt{
 			// Skip plan validation because the acceptance test attempts to regenerate the plan after migrating and

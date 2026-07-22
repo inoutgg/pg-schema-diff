@@ -110,6 +110,7 @@ ALTER TABLE "public"."foobar" DROP CONSTRAINT "pgschemadiff_tmpnn_GimngG1rRkODhK
   * Operators warned of dangerous operations.
   * Migration plans are validated first against a temporary database exactly as they would be performed against the real database.
 * Strong support of partitions
+* Data-preserving table removal with explicit, separately ordered cleanup plans
 # Install
 ```bash
 go get -u github.com/stripe/pg-schema-diff@latest
@@ -134,6 +135,39 @@ if err != nil {
 }	
 ```
 
+Removed and recreated tables are not dropped by the ordinary migration. They are
+moved into uniquely named, marked archival schemas using the default
+`pgschemadiff_archive` prefix. The returned plan has this JSON shape:
+
+```json
+{
+  "statements": [],
+  "cleanup_statements": [
+	{"ddl": "DO ... DROP TABLE ... RESTRICT; DROP SCHEMA ... RESTRICT", "hazards": []}
+  ],
+	"current_schema_hash": "pg-schema-diff:snapshot:v2:sha256:..."
+}
+```
+
+`cleanup_statements` is omitted when empty. A custom prefix replaces the default:
+
+```go
+plan, err := diff.Generate(
+	ctx,
+	diff.DBSchemaSource(connPool),
+	diff.DDLSchemaSource(ddl),
+	diff.WithTempDbFactory(tempDbFactory),
+	diff.WithSchemaPartialArchivalPrefix("deleted_archive"),
+)
+```
+
+Include and exclude schema options still accumulate. Prefix-like schemas are not
+trusted by name alone: only exact generated names with strict, consistent marker
+comments are excluded from managed diffing. Markers bind the archived root and
+partition members by OID, name, and parent edge. Cleanup locks and rechecks those
+facts before using `RESTRICT`. Target schemas may not use the selected reserved
+archival naming grammar.
+
 ## 2. Applying plan
 We leave plan application up to the user. For example, you might want to take out a session-level advisory lock if you are 
 concerned about concurrent migrations on your database. You might also want a second user to approve the plan
@@ -147,6 +181,53 @@ for _, stmt := range plan.Statements {
 	}
 }
 ```
+
+Apply only `plan.Statements` for the ordinary migration. Removed rows remain
+retained and `CleanupStatements` is not applied automatically. Do not concatenate
+the two lists. Cleanup is an optional, destructive, later operation with its own
+hazards:
+
+```go
+for _, stmt := range plan.CleanupStatements {
+	// Require separate review and scheduling before executing destructive cleanup.
+	if _, err := conn.ExecContext(ctx, stmt.ToSQL()); err != nil {
+		panic(fmt.Sprintf("executing cleanup statement: %s", err))
+	}
+}
+```
+
+Ordinary archival statements report `AUTHZ_UPDATE` and lock hazards. Physical
+table deletion and its `DELETES_DATA` hazard are confined to
+`CleanupStatements`; standalone destructive changes such as dropping a column or
+sequence may still report `DELETES_DATA` in the ordinary list.
+
+Before applying a stored plan, compare `plan.CurrentSchemaHash` with
+`schema.GetSchemaHash`. Both use the versioned
+`pg-schema-diff:snapshot:v2:sha256:` contract. Plans generated with a custom
+archival prefix must use the matching public helper:
+
+```go
+currentHash, err := schema.GetSchemaHashWithArchivalPrefix(
+	ctx,
+	connPool,
+	"deleted_archive",
+)
+if err != nil || currentHash != plan.CurrentSchemaHash {
+	panic("the source schema changed after plan generation")
+}
+```
+
+The v2 hash covers the modeled managed schema and the minimal markers for existing
+archive groups. It intentionally does not hash a catalog mirror.
+
+Archival supports ordinary tables and complete declarative partition trees.
+Traditional or multiple inheritance, retained-parent subtrees, foreign or
+temporary tables, cross-boundary foreign keys, publication membership, extended
+statistics, extension-owned objects, enabled event triggers, and retained
+catalog-tracked dependents fail closed. Untrackable routine bodies are not treated
+as dependencies without catalog evidence. Archival requires a live database-backed
+current source; DDL current sources remain supported when no table archival is
+needed.
 
 # Supported Postgres versions
 Supported: 14, 15, 16, 17

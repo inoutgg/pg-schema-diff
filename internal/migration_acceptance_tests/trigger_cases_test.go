@@ -791,7 +791,8 @@ var triggerAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{

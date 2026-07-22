@@ -404,9 +404,7 @@ var foreignKeyConstraintCases = []acceptanceTestCase{
             );
       `,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Drop FK (partitioned table)",
@@ -470,9 +468,7 @@ var foreignKeyConstraintCases = []acceptanceTestCase{
                 FOREIGN KEY (fk_foo, fk_id) REFERENCES "foobar partitioned"(foo, id);
       `,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Alter FK not valid to valid (validate FK isn't dropped and re-added)",

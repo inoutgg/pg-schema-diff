@@ -2,8 +2,6 @@ package dbmswide_tests
 
 import (
 	"testing"
-
-	"github.com/stripe/pg-schema-diff/pkg/diff"
 )
 
 // These are tests for "public" schema" alterations (full migrations)
@@ -392,12 +390,7 @@ var schemaAcceptanceTests = []acceptanceTestCase{
                 GROUP BY fizz, buzz;
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeAuthzUpdate,
-			diff.MigrationHazardTypeDeletesData,
-			diff.MigrationHazardTypeHasUntrackableDependencies,
-			diff.MigrationHazardTypeIndexBuild,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		name: "Drop partitioned table, Add partitioned table with local keys",
@@ -476,9 +469,7 @@ var schemaAcceptanceTests = []acceptanceTestCase{
             
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 }
 

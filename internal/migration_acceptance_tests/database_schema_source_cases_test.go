@@ -142,9 +142,7 @@ var databaseSchemaSourceTestCases = []acceptanceTestCase{
 
 			`,
 		},
-		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
-		},
+		expectedPlanErrorContains: "cross-boundary foreign keys",
 	},
 	{
 		planFactory: dirSchemaSourcePlanFactory([]string{

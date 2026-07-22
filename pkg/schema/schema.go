@@ -6,28 +6,40 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	internalschema "github.com/stripe/pg-schema-diff/internal/schema"
+	"github.com/stripe/pg-schema-diff/pkg/diff"
 )
 
 type GetSchemaOpt = internalschema.GetSchemaOpt
 
+const DefaultCleanupSchemaPrefix = internalschema.DefaultCleanupSchemaPrefix
+
 var (
-	WithIncludeSchemas = internalschema.WithIncludeSchemas
-	WithExcludeSchemas = internalschema.WithExcludeSchemas
+	WithIncludeSchemaPatterns = internalschema.WithIncludeSchemaPatterns
+	WithExcludeSchemaPatterns = internalschema.WithExcludeSchemaPatterns
 )
 
-// GetSchemaHash hash gets the hash of the target schema. It can be used to compare against the hash in the migration
-// plan to determine if the plan is still valid.
+// GetSchemaHash returns the versioned source snapshot hash using the default
+// archival prefix. It can be compared with diff.Plan.CurrentSchemaHash to
+// determine whether a serialized plan still applies to the database.
 //
 // We do not expose the Schema struct yet because it is subject to change, and we do not want folks depending on its API.
 func GetSchemaHash(ctx context.Context, connPool *pgxpool.Pool, opts ...GetSchemaOpt) (string, error) {
-	schema, err := internalschema.GetSchema(ctx, connPool, opts...)
-	if err != nil {
-		return "", fmt.Errorf("getting public schema: %w", err)
-	}
-	hash, err := schema.Hash()
-	if err != nil {
-		return "", fmt.Errorf("hashing schema: %w", err)
-	}
+	return GetSchemaHashWithArchivalPrefix(ctx, connPool, DefaultCleanupSchemaPrefix, opts...)
+}
 
+// GetSchemaHashWithArchivalPrefix returns the versioned source snapshot hash
+// using the same archival prefix and strict marker trust contract as
+// diff.Generate. A custom prefix replaces the default; include and exclude
+// schema options continue to accumulate.
+func GetSchemaHashWithArchivalPrefix(
+	ctx context.Context,
+	connPool *pgxpool.Pool,
+	cleanupPrefix string,
+	opts ...GetSchemaOpt,
+) (string, error) {
+	hash, err := diff.GetSchemaHash(ctx, connPool, cleanupPrefix, opts...)
+	if err != nil {
+		return "", fmt.Errorf("getting public schema hash: %w", err)
+	}
 	return hash, nil
 }

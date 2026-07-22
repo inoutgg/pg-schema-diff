@@ -10,8 +10,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mitchellh/hashstructure/v2"
-	"golang.org/x/sync/errgroup"
+
+	dbsqlc "github.com/stripe/pg-schema-diff/internal/queries"
 )
+
+const DefaultCleanupSchemaPrefix = "pgschemadiff_archive"
 
 type (
 	// Object represents a resource in a schema (table, column, index...)
@@ -62,6 +65,11 @@ type Schema struct {
 	Triggers              []Trigger
 	Views                 []View
 	MaterializedViews     []MaterializedView
+}
+
+// SchemaSnapshot contains the normalized modeled schema read from one catalog snapshot.
+type SchemaSnapshot struct {
+	Schema Schema
 }
 
 // Normalize sorts schema objects while preserving the physical order of table columns.
@@ -366,8 +374,15 @@ const (
 	PkIndexConstraintType IndexConstraintType = "p"
 
 	RelKindOrdinaryTable    RelKind = "r"
+	RelKindIndex            RelKind = "i"
+	RelKindSequence         RelKind = "S"
+	RelKindToastTable       RelKind = "t"
+	RelKindView             RelKind = "v"
 	RelKindPartitionedTable RelKind = "p"
 	RelKindMaterializedView RelKind = "m"
+	RelKindCompositeType    RelKind = "c"
+	RelKindForeignTable     RelKind = "f"
+	RelKindPartitionedIndex RelKind = "I"
 )
 
 func (i Index) GetName() string {
@@ -540,33 +555,81 @@ type (
 	GetSchemaOpt func(*getSchemaOptions)
 )
 
-// WithIncludeSchemas filters the schema to only include the given schemas. This unions with any schemas that are already included
-// via WithIncludeSchemas. If empty, then all schemas are included.
-func WithIncludeSchemas(schemas ...string) GetSchemaOpt {
+// WithIncludeSchemaPatterns filters the schema to only include schema names that fully match one of the provided Go
+// regular expressions. This unions with patterns already included via WithIncludeSchemaPatterns. If empty, all schemas
+// are included.
+func WithIncludeSchemaPatterns(patterns ...string) GetSchemaOpt {
 	return func(o *getSchemaOptions) {
-		o.includeSchemas = append(o.includeSchemas, schemas...)
+		o.includeSchemaPatterns = append(o.includeSchemaPatterns, patterns...)
 	}
 }
 
-// WithExcludeSchemas filters the schema to exclude the given schemas. This unions with any schemas that are already excluded
-// via WithExcludeSchemas. If empty, then no schemas are excluded.
-func WithExcludeSchemas(schemas ...string) GetSchemaOpt {
+// WithExcludeSchemaPatterns filters the schema to exclude schema names that fully match any of the provided Go regular
+// expressions. This unions with patterns already excluded via WithExcludeSchemaPatterns. If empty, no schemas are
+// excluded.
+func WithExcludeSchemaPatterns(patterns ...string) GetSchemaOpt {
 	return func(o *getSchemaOptions) {
-		o.excludeSchemas = append(o.excludeSchemas, schemas...)
+		o.excludeSchemaPatterns = append(o.excludeSchemaPatterns, patterns...)
 	}
 }
 
 type getSchemaOptions struct {
-	// includeSchemas is a list of schemas to include in the schema. If empty, then all schemas are included.
+	// includeSchemaPatterns is a list of schema name patterns to include. If empty, then all schemas are included.
 	// We could have built a more complex set of options using the nameFilter system (nested unions and intersections);
 	// however, I felt it could expose some weird behaviors that we don't want to have to worry about just yet,
-	includeSchemas []string
-	// excludeSchemas is the exclude analog of includeSchemas.
-	excludeSchemas []string
+	includeSchemaPatterns []string
+	// excludeSchemaPatterns is the exclude analog of includeSchemaPatterns.
+	excludeSchemaPatterns []string
 }
 
-// GetSchema fetches the database schema. It is a non-atomic operation.
-func GetSchema(ctx context.Context, db *pgxpool.Pool, opts ...GetSchemaOpt) (*Schema, error) {
+// GetSchemaSnapshot fetches the modeled database schema from one consistent catalog snapshot.
+func GetSchemaSnapshot(ctx context.Context, db *pgxpool.Pool, opts ...GetSchemaOpt) (SchemaSnapshot, error) {
+	nameFilter, err := getSchemaNameFilter(opts...)
+	if err != nil {
+		return SchemaSnapshot{}, err
+	}
+
+	conn, err := db.Acquire(ctx)
+	if err != nil {
+		return SchemaSnapshot{}, fmt.Errorf("acquiring connection for schema snapshot: %w", err)
+	}
+	defer conn.Release()
+
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return SchemaSnapshot{}, fmt.Errorf("beginning schema snapshot transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(context.WithoutCancel(ctx))
+		}
+	}()
+
+	snapshot, err := getSchemaSnapshot(ctx, tx, nameFilter)
+	if err != nil {
+		return SchemaSnapshot{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SchemaSnapshot{}, fmt.Errorf("committing schema snapshot transaction: %w", err)
+	}
+	committed = true
+
+	return snapshot, nil
+}
+
+func getSchemaSnapshot(ctx context.Context, db dbsqlc.DBTX, nameFilter nameFilter) (SchemaSnapshot, error) {
+	fetchedSchema, err := (&schemaFetcher{nameFilter: nameFilter}).getSchema(ctx, db)
+	if err != nil {
+		return SchemaSnapshot{}, err
+	}
+	return SchemaSnapshot{Schema: fetchedSchema.Normalize()}, nil
+}
+
+func getSchemaNameFilter(opts ...GetSchemaOpt) (nameFilter, error) {
 	options := getSchemaOptions{}
 	for _, opt := range opts {
 		opt(&options)
@@ -577,59 +640,59 @@ func GetSchema(ctx context.Context, db *pgxpool.Pool, opts ...GetSchemaOpt) (*Sc
 		return nil, fmt.Errorf("building name filter: %w", err)
 	}
 
-	return (&schemaFetcher{nameFilter: nameFilter}).getSchema(ctx, db)
+	return nameFilter, nil
 }
 
 func buildNameFilter(options getSchemaOptions) (nameFilter, error) {
-	if intersection := intersect(options.includeSchemas, options.excludeSchemas); len(intersection) > 0 {
-		return nil, fmt.Errorf("schemas %v are both included and excluded", intersection)
+	includeSchemasFilter, err := buildIncludeSchemasFilter(options.includeSchemaPatterns)
+	if err != nil {
+		return nil, err
 	}
-
-	includeSchemasFilter := buildIncludeSchemasFilter(options.includeSchemas)
-	excludeSchemasFilter := buildExcludeSchemasFilter(options.excludeSchemas)
+	excludeSchemasFilter, err := buildExcludeSchemasFilter(options.excludeSchemaPatterns)
+	if err != nil {
+		return nil, err
+	}
 	return andNameFilter(includeSchemasFilter, excludeSchemasFilter), nil
 }
 
-func intersect(a, b []string) []string {
-	inAByA := make(map[string]bool)
-	for _, s := range a {
-		inAByA[s] = true
-	}
-	intersection := make([]string, 0, len(b))
-	for _, s := range b {
-		if inAByA[s] {
-			intersection = append(intersection, s)
-		}
-	}
-	return intersection
-}
-
-func buildIncludeSchemasFilter(schemas []string) nameFilter {
-	if len(schemas) == 0 {
+func buildIncludeSchemasFilter(patterns []string) (nameFilter, error) {
+	if len(patterns) == 0 {
 		return func(name SchemaQualifiedName) bool {
 			return true
-		}
+		}, nil
 	}
 
 	var filters []nameFilter
-	for _, schema := range schemas {
-		filters = append(filters, schemaNameFilter(schema))
+	for _, pattern := range patterns {
+		compiledPattern, err := compileSchemaNamePattern(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("compiling include schema pattern %q: %w", pattern, err)
+		}
+		filters = append(filters, schemaNamePatternFilter(compiledPattern))
 	}
-	return orNameFilter(filters...)
+	return orNameFilter(filters...), nil
 }
 
-func buildExcludeSchemasFilter(schemas []string) nameFilter {
-	if len(schemas) == 0 {
+func buildExcludeSchemasFilter(patterns []string) (nameFilter, error) {
+	if len(patterns) == 0 {
 		return func(name SchemaQualifiedName) bool {
 			return true
-		}
+		}, nil
 	}
 
 	var filters []nameFilter
-	for _, schema := range schemas {
-		filters = append(filters, notSchemaNameFilter(schema))
+	for _, pattern := range patterns {
+		compiledPattern, err := compileSchemaNamePattern(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("compiling exclude schema pattern %q: %w", pattern, err)
+		}
+		filters = append(filters, notSchemaNamePatternFilter(compiledPattern))
 	}
-	return andNameFilter(filters...)
+	return andNameFilter(filters...), nil
+}
+
+func compileSchemaNamePattern(pattern string) (*regexp.Regexp, error) {
+	return regexp.Compile("^(?:" + pattern + ")$")
 }
 
 type (
@@ -648,75 +711,63 @@ type (
 	}
 )
 
-func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schema, error) {
+func (s *schemaFetcher) getSchema(ctx context.Context, db dbsqlc.DBTX) (*Schema, error) {
 	var result Schema
-	// Fetch object types in parallel. Tables, check constraints, and functions also parallelize their per-object queries.
-	group, groupCtx := errgroup.WithContext(ctx)
-	group.SetLimit(maxConcurrentSchemaQueries)
-	group.Go(func() error {
-		var err error
-		result.NamedSchemas, err = fetchNamedSchemas(groupCtx, db)
-		return wrapSchemaFetchError("named schemas", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Extensions, err = fetchExtensions(groupCtx, db)
-		return wrapSchemaFetchError("extensions", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Enums, err = fetchEnums(groupCtx, db)
-		return wrapSchemaFetchError("enums", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Tables, err = fetchTables(groupCtx, db)
-		return wrapSchemaFetchError("tables", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Indexes, err = fetchIndexes(groupCtx, db)
-		return wrapSchemaFetchError("indexes", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.ForeignKeyConstraints, err = fetchForeignKeyCons(groupCtx, db)
-		return wrapSchemaFetchError("foreign key constraints", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Sequences, err = fetchSequences(groupCtx, db)
-		return wrapSchemaFetchError("sequences", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Functions, err = fetchFunctions(groupCtx, db)
-		return wrapSchemaFetchError("functions", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Procedures, err = fetchProcedures(groupCtx, db)
-		return wrapSchemaFetchError("procedures", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Triggers, err = fetchTriggers(groupCtx, db)
-		return wrapSchemaFetchError("triggers", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.Views, err = fetchViews(groupCtx, db)
-		return wrapSchemaFetchError("views", err)
-	})
-	group.Go(func() error {
-		var err error
-		result.MaterializedViews, err = fetchMaterializedViews(groupCtx, db)
-		return wrapSchemaFetchError("materialized views", err)
-	})
-	if err := group.Wait(); err != nil {
+	var err error
+	result.NamedSchemas, err = fetchNamedSchemas(ctx, db)
+	if err := wrapSchemaFetchError("named schemas", err); err != nil {
+		return nil, err
+	}
+	result.Extensions, err = fetchExtensions(ctx, db)
+	if err := wrapSchemaFetchError("extensions", err); err != nil {
+		return nil, err
+	}
+	result.Enums, err = fetchEnums(ctx, db)
+	if err := wrapSchemaFetchError("enums", err); err != nil {
+		return nil, err
+	}
+	result.Tables, err = fetchTables(ctx, db)
+	if err := wrapSchemaFetchError("tables", err); err != nil {
+		return nil, err
+	}
+	result.Indexes, err = fetchIndexes(ctx, db)
+	if err := wrapSchemaFetchError("indexes", err); err != nil {
+		return nil, err
+	}
+	result.ForeignKeyConstraints, err = fetchForeignKeyCons(ctx, db)
+	if err := wrapSchemaFetchError("foreign key constraints", err); err != nil {
+		return nil, err
+	}
+	result.Sequences, err = fetchSequences(ctx, db)
+	if err := wrapSchemaFetchError("sequences", err); err != nil {
+		return nil, err
+	}
+	result.Functions, err = fetchFunctions(ctx, db)
+	if err := wrapSchemaFetchError("functions", err); err != nil {
+		return nil, err
+	}
+	result.Procedures, err = fetchProcedures(ctx, db)
+	if err := wrapSchemaFetchError("procedures", err); err != nil {
+		return nil, err
+	}
+	result.Triggers, err = fetchTriggers(ctx, db)
+	if err := wrapSchemaFetchError("triggers", err); err != nil {
+		return nil, err
+	}
+	result.Views, err = fetchViews(ctx, db)
+	if err := wrapSchemaFetchError("views", err); err != nil {
+		return nil, err
+	}
+	result.MaterializedViews, err = fetchMaterializedViews(ctx, db)
+	if err := wrapSchemaFetchError("materialized views", err); err != nil {
 		return nil, err
 	}
 
+	filtered := filterSchema(result, s.nameFilter)
+	return &filtered, nil
+}
+
+func filterSchema(result Schema, nameFilter nameFilter) Schema {
 	result.NamedSchemas = filterSliceByName(
 		result.NamedSchemas,
 		func(s NamedSchema) SchemaQualifiedName {
@@ -725,21 +776,21 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 				EscapedName: EscapeIdentifier(s.Name),
 			}
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Extensions = filterSliceByName(
 		result.Extensions,
 		func(e Extension) SchemaQualifiedName {
 			return e.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Enums = filterSliceByName(
 		result.Enums,
 		func(enum Enum) SchemaQualifiedName {
 			return enum.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 
 	var filteredTables []Table
@@ -752,7 +803,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 					EscapedName: EscapeIdentifier(cc.Name),
 				}
 			},
-			s.nameFilter,
+			nameFilter,
 		)
 		table.Policies = filterSliceByName(
 			table.Policies,
@@ -762,14 +813,14 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 					EscapedName: p.EscapedName,
 				}
 			},
-			s.nameFilter,
+			nameFilter,
 		)
 		table.Privileges = filterSliceByName(
 			table.Privileges,
 			func(TablePrivilege) SchemaQualifiedName {
 				return table.SchemaQualifiedName
 			},
-			s.nameFilter,
+			nameFilter,
 		)
 		filteredTables = append(filteredTables, table)
 	}
@@ -778,14 +829,14 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 		func(t Table) SchemaQualifiedName {
 			return t.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Indexes = filterSliceByName(
 		result.Indexes,
 		func(idx Index) SchemaQualifiedName {
 			return idx.GetSchemaQualifiedName()
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.ForeignKeyConstraints = filterSliceByName(
 		result.ForeignKeyConstraints,
@@ -795,7 +846,7 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 				EscapedName: fkCon.EscapedName,
 			}
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Sequences = filterSliceByName(
 		result.Sequences,
@@ -805,21 +856,21 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 				EscapedName: seq.EscapedName,
 			}
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Functions = filterSliceByName(
 		result.Functions,
 		func(function Function) SchemaQualifiedName {
 			return function.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Procedures = filterSliceByName(
 		result.Procedures,
 		func(procedure Procedure) SchemaQualifiedName {
 			return procedure.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Triggers = filterSliceByName(
 		result.Triggers,
@@ -829,24 +880,38 @@ func (s *schemaFetcher) getSchema(ctx context.Context, db *pgxpool.Pool) (*Schem
 				EscapedName: trigger.EscapedName,
 			}
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.Views = filterSliceByName(
 		result.Views,
 		func(view View) SchemaQualifiedName {
 			return view.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 	result.MaterializedViews = filterSliceByName(
 		result.MaterializedViews,
 		func(materializedView MaterializedView) SchemaQualifiedName {
 			return materializedView.SchemaQualifiedName
 		},
-		s.nameFilter,
+		nameFilter,
 	)
 
-	return &result, nil
+	return result
+}
+
+// ExcludeSchemaNames returns a normalized copy without objects in the named
+// schemas. It is used after archival marker validation so catalog acquisition
+// can remain unfiltered until trust has been established.
+func ExcludeSchemaNames(input Schema, names []string) Schema {
+	excluded := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		excluded[name] = struct{}{}
+	}
+	return filterSchema(input, func(name SchemaQualifiedName) bool {
+		_, skip := excluded[name.SchemaName]
+		return !skip
+	}).Normalize()
 }
 
 func wrapSchemaFetchError(name string, err error) error {

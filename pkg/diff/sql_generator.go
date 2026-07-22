@@ -218,7 +218,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 
 	newSchemaTablesByName := buildSchemaObjByNameMap(new.Tables)
 	addedTablesByName := buildSchemaObjByNameMap(tableDiffs.adds)
-	deletedTablesByName := buildSchemaObjByNameMap(tableDiffs.deletes)
+	removedTablesByName := buildSchemaObjByNameMap(tableDiffs.deletes)
 	tableDiffsByName := buildDiffByNameMap[schema.Table, tableDiff](tableDiffs.alters)
 	indexesDiff, err := diffLists(old.Indexes, new.Indexes, func(
 		oldIdx, newIdx schema.Index,
@@ -314,7 +314,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	viewDiffs, err := diffLists(old.Views, new.Views, func(old, new schema.View) (
 		diff viewDiff, requiresRecreation bool, error error,
 	) {
-		return buildViewDiff(deletedTablesByName, tableDiffsByName, old, new)
+		return buildViewDiff(removedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing views: %w", err)
@@ -323,7 +323,7 @@ func buildSchemaDiff(old, new schema.Schema) (schemaDiff, bool, error) {
 	materializedViewDiffs, err := diffLists(old.MaterializedViews, new.MaterializedViews, func(
 		old, new schema.MaterializedView,
 	) (diff materializedViewDiff, requiresRecreation bool, error error) {
-		return buildMaterializedViewDiff(deletedTablesByName, tableDiffsByName, old, new)
+		return buildMaterializedViewDiff(removedTablesByName, tableDiffsByName, old, new)
 	})
 	if err != nil {
 		return schemaDiff{}, false, fmt.Errorf("diffing materialized views: %w", err)
@@ -528,8 +528,9 @@ func buildIndexDiff(deps indexDiffConfig, old, new schema.Index) (diff indexDiff
 }
 
 type schemaSQLGenerator struct {
-	randReader  io.Reader
-	planOptions *planOptions
+	randReader      io.Reader
+	planOptions     *planOptions
+	archivalByTable map[string]archivalTablePlan
 }
 
 func newSchemaSQLGenerator(randReader io.Reader, planOpts *planOptions) *schemaSQLGenerator {
@@ -541,8 +542,8 @@ func newSchemaSQLGenerator(randReader io.Reader, planOpts *planOptions) *schemaS
 
 func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	tablesInNewSchemaByName := buildSchemaObjByNameMap(diff.new.Tables)
-	deletedTablesByName := buildSchemaObjByNameMap(diff.tableDiffs.deletes)
 	addedTablesByName := buildSchemaObjByNameMap(diff.tableDiffs.adds)
+	deletedTablesByName := buildSchemaObjByNameMap(diff.tableDiffs.deletes)
 
 	materializedViewsInNewSchemaByName := buildSchemaObjByNameMap(diff.new.MaterializedViews)
 	deletedMaterializedViewsByName := buildSchemaObjByNameMap(diff.materializedViewDiffs.deletes)
@@ -558,6 +559,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	tablePartialGraph, err := generatePartialGraph(&tableSQLVertexGenerator{
 		randReader:              s.randReader,
 		deletedTablesByName:     deletedTablesByName,
+		archivalByTable:         s.archivalByTable,
 		tablesInNewSchemaByName: tablesInNewSchemaByName,
 		tableDiffsByName:        buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
 	}, diff.tableDiffs)
@@ -586,7 +588,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, attachPartitionsPartialGraph)
 
 	renameConflictingIndexesGenerator := newRenameConflictingIndexSQLVertexGenerator(
-		s.randReader, buildSchemaObjByNameMap(diff.old.Indexes),
+		s.randReader, buildSchemaObjByNameMap(diff.old.Indexes), s.archivalByTable,
 	)
 	renameConflictingIndexesPartialGraph, err :=
 		generatePartialGraph(renameConflictingIndexesGenerator, diff.indexDiffs)
@@ -617,6 +619,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	partialGraph = concatPartialGraphs(partialGraph, indexesPartialGraph)
 
 	foreignKeyGenerator := newForeignKeyConstraintSQLVertexGenerator(diff.oldAndNew, diff.tableDiffs)
+	foreignKeyGenerator.archivalByTable = s.archivalByTable
 	fkConsPartialGraph, err := generatePartialGraph(foreignKeyGenerator, diff.foreignKeyConstraintDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving foreign key constraint diff: %w", err)
@@ -626,6 +629,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	sequenceGenerator := &sequenceSQLVertexGenerator{
 		deletedTablesByName: deletedTablesByName,
 		tableDiffsByName:    buildDiffByNameMap[schema.Table, tableDiff](diff.tableDiffs.alters),
+		archivalByTable:     s.archivalByTable,
 	}
 	sequencesPartialGraph, err := generatePartialGraph(sequenceGenerator, diff.sequenceDiffs)
 	if err != nil {
@@ -654,7 +658,7 @@ func (s schemaSQLGenerator) Alter(diff schemaDiff) ([]Statement, error) {
 	}
 	partialGraph = concatPartialGraphs(partialGraph, proceduresPartialGraph)
 
-	triggerGenerator := &triggerSQLVertexGenerator{}
+	triggerGenerator := &triggerSQLVertexGenerator{archivalByTable: s.archivalByTable}
 	triggersPartialGraph, err := generatePartialGraph(triggerGenerator, diff.triggerDiffs)
 	if err != nil {
 		return nil, fmt.Errorf("resolving trigger diff: %w", err)
@@ -783,6 +787,7 @@ func buildMap[K comparable, V any](v []V, getKey func(V) K) map[K]V {
 type tableSQLVertexGenerator struct {
 	randReader              io.Reader
 	deletedTablesByName     map[string]schema.Table
+	archivalByTable         map[string]archivalTablePlan
 	tablesInNewSchemaByName map[string]schema.Table
 	tableDiffsByName        map[string]tableDiff
 }
@@ -802,9 +807,6 @@ func (t *tableSQLVertexGenerator) Add(table schema.Table) (partialSQLGraph, erro
 
 func (t *tableSQLVertexGenerator) addStatements(table schema.Table) ([]Statement, error) {
 	if table.IsPartition() {
-		if table.IsPartitioned() {
-			return nil, fmt.Errorf("partitioned partitions: %w", ErrNotImplemented)
-		}
 		if len(table.CheckConstraints) > 0 {
 			return nil, fmt.Errorf("check constraints on partitions: %w", ErrNotImplemented)
 		}
@@ -918,6 +920,12 @@ func (t *tableSQLVertexGenerator) Delete(table schema.Table) (partialSQLGraph, e
 }
 
 func (t *tableSQLVertexGenerator) deleteStatements(table schema.Table) ([]Statement, error) {
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		if archival.root {
+			return []Statement{archival.group.statement}, nil
+		}
+		return nil, nil
+	}
 	if table.IsPartition() {
 		// Don't support dropping partitions without dropping the base table. This would be easy to implement, but we
 		// would need to add tests for it.
@@ -1193,6 +1201,15 @@ func (t *tableSQLVertexGenerator) getAddAlterDependencies(table schema.Table) []
 			buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete),
 		),
 	}
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		root := schema.SchemaQualifiedName{
+			SchemaName:  archival.group.marker.Root.Schema,
+			EscapedName: schema.EscapeIdentifier(archival.group.marker.Root.Name),
+		}
+		deps = append(deps, mustRun(buildTableVertexId(table.SchemaQualifiedName, diffTypeAddAlter)).after(
+			buildTableVertexId(root, diffTypeDelete),
+		))
+	}
 
 	if table.ParentTable != nil {
 		deps = append(
@@ -1264,6 +1281,24 @@ func buildTempNotNullConstraint(randReader io.Reader, colDiff columnDiff) (schem
 
 func (t *tableSQLVertexGenerator) getDeleteDependencies(table schema.Table) []dependency {
 	var deps []dependency
+	if archival, ok := t.archivalByTable[table.GetName()]; ok {
+		if !archival.root {
+			return nil
+		}
+		rootVertex := buildTableVertexId(table.SchemaQualifiedName, diffTypeDelete)
+		for _, member := range archival.group.members {
+			if member.name == archival.group.marker.Root {
+				continue
+			}
+			memberName := schema.SchemaQualifiedName{
+				SchemaName: member.name.Schema, EscapedName: schema.EscapeIdentifier(member.name.Name),
+			}
+			deps = append(deps, mustRun(rootVertex).after(
+				buildTableVertexId(memberName, diffTypeDelete),
+			))
+		}
+		return deps
+	}
 	if table.ParentTable != nil {
 		deps = append(
 			deps,
@@ -1579,15 +1614,18 @@ type renameConflictingIndexSQLVertexGenerator struct {
 	// It is used to identify if an index has been re-created
 	oldSchemaIndexesByName map[string]schema.Index
 	indexRenamesByOldName  map[string]string
+	archivalByTable        map[string]archivalTablePlan
 }
 
 func newRenameConflictingIndexSQLVertexGenerator(randReader io.Reader,
 	oldSchemaIndexesByName map[string]schema.Index,
+	archivalByTable map[string]archivalTablePlan,
 ) *renameConflictingIndexSQLVertexGenerator {
 	return &renameConflictingIndexSQLVertexGenerator{
 		randReader:             randReader,
 		oldSchemaIndexesByName: oldSchemaIndexesByName,
 		indexRenamesByOldName:  make(map[string]string),
+		archivalByTable:        archivalByTable,
 	}
 }
 
@@ -1605,9 +1643,17 @@ func (rsg *renameConflictingIndexSQLVertexGenerator) Add(index schema.Index) (pa
 }
 
 func (rsg *renameConflictingIndexSQLVertexGenerator) addStatements(index schema.Index) ([]Statement, error) {
-	if oldIndex, indexIsBeingRecreated := rsg.oldSchemaIndexesByName[index.GetName()]; !indexIsBeingRecreated {
+	oldIndex, indexIsBeingRecreated := rsg.oldSchemaIndexesByName[index.GetName()]
+	if !indexIsBeingRecreated {
 		return nil, nil
-	} else if oldIndex.IsPk() && index.IsPk() {
+	}
+	if oldIndex.OwningRelKind != schema.RelKindMaterializedView {
+		if _, archived := rsg.archivalByTable[oldIndex.OwningRelName.GetName()]; archived {
+			// SET SCHEMA frees the old index name without rebuilding or renaming it.
+			return nil, nil
+		}
+	}
+	if oldIndex.IsPk() && index.IsPk() {
 		// Don't bother renaming if both are primary keys, since the new index will need to be created after the old
 		// index because we can't have two primary keys at the same time.
 		//
@@ -1681,7 +1727,7 @@ func buildRenameConflictingIndexVertexId(indexName schema.SchemaQualifiedName, d
 }
 
 type indexSQLVertexGenerator struct {
-	// deletedTablesByName is a map of table name to the deleted tables (and partitions)
+	// deletedTablesByName is a map of removed tables and partitions.
 	deletedTablesByName map[string]schema.Table
 	// addedTablesByName is a map of table name to the new tables (and partitions)
 	// This is used to identify if hazards are necessary
@@ -1711,9 +1757,9 @@ type indexSQLVertexGenerator struct {
 	planOptions *planOptions
 }
 
-// wasOwningRelationDeleted returns true if the owning table or materialized view was deleted.
-// If the owning relation was deleted, the index will be automatically dropped.
-func (isg *indexSQLVertexGenerator) wasOwningRelationDeleted(index schema.Index) bool {
+// isIndexRemovalHandledByOwningRelation reports whether the relation removal
+// either drops the index implicitly or preserves it through an archival move.
+func (isg *indexSQLVertexGenerator) isIndexRemovalHandledByOwningRelation(index schema.Index) bool {
 	switch index.OwningRelKind {
 	case schema.RelKindMaterializedView:
 		_, deleted := isg.deletedMaterializedViewsByName[index.OwningRelName.GetName()]
@@ -1866,7 +1912,7 @@ func (isg *indexSQLVertexGenerator) Delete(index schema.Index) (partialSQLGraph,
 
 func (isg *indexSQLVertexGenerator) deleteStatements(index schema.Index) ([]Statement, error) {
 	// An index will be dropped if its owning relation (table or materialized view) is dropped.
-	if isg.wasOwningRelationDeleted(index) {
+	if isg.isIndexRemovalHandledByOwningRelation(index) {
 		return nil, nil
 	}
 
@@ -2545,6 +2591,7 @@ func buildForeignKeyConstraintDiff(fsg *foreignKeyConstraintSQLVertexGenerator,
 }
 
 type foreignKeyConstraintSQLVertexGenerator struct {
+	archivalByTable map[string]archivalTablePlan
 	// newSchemaTablesByName is a map of table name to tables in the new schema.
 	newSchemaTablesByName map[string]schema.Table
 	// addedTablesByName is a map of table name to the added tables
@@ -2640,6 +2687,11 @@ func (f *foreignKeyConstraintSQLVertexGenerator) Delete(con schema.ForeignKeyCon
 }
 
 func (f *foreignKeyConstraintSQLVertexGenerator) deleteStatements(con schema.ForeignKeyConstraint) []Statement {
+	owner, ownerArchived := f.archivalByTable[con.OwningTable.GetName()]
+	foreign, foreignArchived := f.archivalByTable[con.ForeignTable.GetName()]
+	if ownerArchived && foreignArchived && owner.group == foreign.group {
+		return nil
+	}
 	// Always generate a drop statement even if the owning table is being deleted. This simplifies the logic a bit because
 	// if the owning table has a circular FK dependency with another table being dropped, we will need to explicitly drop
 	// one of the FK's first
@@ -2746,6 +2798,7 @@ func (f *foreignKeyConstraintSQLVertexGenerator) getDeleteDependencies(con schem
 type sequenceSQLVertexGenerator struct {
 	deletedTablesByName map[string]schema.Table
 	tableDiffsByName    map[string]tableDiff
+	archivalByTable     map[string]archivalTablePlan
 }
 
 func (s *sequenceSQLVertexGenerator) Add(seq schema.Sequence) (partialSQLGraph, error) {
@@ -2777,7 +2830,7 @@ func (s *sequenceSQLVertexGenerator) deleteStatements(seq schema.Sequence) []Sta
 		Type:    MigrationHazardTypeDeletesData,
 		Message: "By deleting a sequence, its value will be permanently lost",
 	}}
-	if seq.Owner != nil && (s.isDeletedWithOwningTable(seq) || s.isDeletedWithColumns(seq)) {
+	if seq.Owner != nil && (s.isSequenceRemovalHandledByOwningTable(seq) || s.isDeletedWithColumns(seq)) {
 		return nil
 	} else if seq.Owner == nil {
 		hazards = append(hazards, migrationHazardSequenceCannotTrackDependencies)
@@ -2889,16 +2942,21 @@ func (s *sequenceSQLVertexGenerator) getDeleteDependencies(seq schema.Sequence) 
 	// old owner column delete (equivalent to add/alter) and the sequence add/alter. We can get away with this because
 	// we, so far, no columns are ever "re-created". If we ever do support that, we'll need to revisit this.
 	if seq.Owner != nil {
-		deps = append(deps, mustRun(buildSequenceVertexId(seq.SchemaQualifiedName, diffTypeDelete)).after(
-			buildTableVertexId(seq.Owner.TableName, diffTypeDelete),
-		))
+		ownerDelete := buildTableVertexId(seq.Owner.TableName, diffTypeDelete)
+		if archival, ok := s.archivalByTable[seq.Owner.TableName.GetName()]; ok {
+			ownerDelete = buildTableVertexId(schema.SchemaQualifiedName{
+				SchemaName:  archival.group.marker.Root.Schema,
+				EscapedName: schema.EscapeIdentifier(archival.group.marker.Root.Name),
+			}, diffTypeDelete)
+		}
+		deps = append(deps, mustRun(buildSequenceVertexId(seq.SchemaQualifiedName, diffTypeDelete)).after(ownerDelete))
 	}
 	return deps
 }
 
-func (s *sequenceSQLVertexGenerator) isDeletedWithOwningTable(seq schema.Sequence) bool {
+func (s *sequenceSQLVertexGenerator) isSequenceRemovalHandledByOwningTable(seq schema.Sequence) bool {
 	if _, ok := s.deletedTablesByName[seq.Owner.TableName.GetName()]; ok {
-		// If the sequence is owned by a table that is also being deleted, we don't need to drop the sequence.
+		// Physical table deletion drops the sequence, while archival moves preserve it.
 		return true
 	}
 	return false

@@ -201,7 +201,8 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 		},
 		newSchemaDDL: nil,
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -269,7 +270,8 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -303,7 +305,8 @@ var viewAcceptanceTestCases = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{

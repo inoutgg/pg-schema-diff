@@ -1,12 +1,13 @@
 package schema_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	internalschema "github.com/stripe/pg-schema-diff/internal/schema"
 	"github.com/stripe/pg-schema-diff/internal/testdb"
+	"github.com/stripe/pg-schema-diff/pkg/diff"
 	"github.com/stripe/pg-schema-diff/pkg/schema"
 )
 
@@ -72,14 +73,75 @@ func TestSchemaTestSuite(t *testing.T) {
 		_, err := db.ConnPool.Exec(t.Context(), ddl)
 		require.NoError(t, err)
 
-		hash, err := schema.GetSchemaHash(t.Context(), db.ConnPool, schema.WithIncludeSchemas("public"))
+		hash, err := schema.GetSchemaHash(t.Context(), db.ConnPool,
+			schema.WithIncludeSchemaPatterns("public"))
 		require.NoError(t, err)
 
-		schema, err := internalschema.GetSchema(t.Context(), db.ConnPool,
-			internalschema.WithIncludeSchemas("public"))
-		require.NoError(t, err)
-		expectedHash, err := schema.Hash()
-		require.NoError(t, err)
-		assert.Equal(t, expectedHash, hash)
+		assert.True(t, strings.HasPrefix(hash, "pg-schema-diff:snapshot:v2:sha256:"))
 	})
+
+	t.Run("TestGetSchemaHashDoesNotHideUnmarkedPrefixSchemas", func(t *testing.T) {
+		t.Parallel()
+
+		factory := testdb.MustNewFactory(t)
+		db := factory.CreateDatabase(t)
+		_, err := db.ConnPool.Exec(t.Context(), `
+			CREATE SCHEMA pgschemadiff_archive_public_foo;
+			CREATE TABLE pgschemadiff_archive_public_foo.foo (id bigint PRIMARY KEY);
+			CREATE SCHEMA deleted_public_foo;
+			CREATE TABLE deleted_public_foo.foo (id bigint PRIMARY KEY);
+		`)
+		require.NoError(t, err)
+
+		hash, err := schema.GetSchemaHash(t.Context(), db.ConnPool)
+		require.NoError(t, err)
+
+		assert.True(t, strings.HasPrefix(hash, "pg-schema-diff:snapshot:v2:sha256:"))
+
+		customHash, err := schema.GetSchemaHash(t.Context(), db.ConnPool,
+			schema.WithExcludeSchemaPatterns("deleted.*"))
+		require.NoError(t, err)
+		assert.NotEqual(t, hash, customHash)
+	})
+}
+
+func TestGetSchemaHashMatchesGenerateWithExistingArchiveAndFilter(t *testing.T) {
+	t.Parallel()
+	factory := testdb.MustNewFactory(t)
+	db := factory.CreateDatabase(t)
+	_, err := db.ConnPool.Exec(t.Context(), `
+		CREATE SCHEMA managed;
+		CREATE TABLE managed.keep (id bigint PRIMARY KEY);
+		CREATE TABLE managed.removed (id bigint);
+		CREATE SCHEMA ignored;
+		CREATE TABLE ignored.unmanaged (id bigint);
+	`)
+	require.NoError(t, err)
+	targetDDL := []string{`
+		CREATE SCHEMA managed;
+		CREATE TABLE managed.keep (id bigint PRIMARY KEY);
+	`}
+	options := []diff.PlanOpt{
+		diff.WithTempDbFactory(factory),
+		diff.WithSchemaPartialArchivalPrefix("hash_archive"),
+		diff.WithIncludeSchemaPatterns("managed"),
+		diff.WithRandReader(strings.NewReader("hashmark")),
+	}
+	archivePlan, err := diff.Generate(t.Context(), diff.DBSchemaSource(db.ConnPool),
+		diff.DDLSchemaSource(targetDDL), options...)
+	require.NoError(t, err)
+	for _, statement := range archivePlan.Statements {
+		_, err = db.ConnPool.Exec(t.Context(), statement.ToSQL())
+		require.NoError(t, err)
+	}
+
+	plan, err := diff.Generate(t.Context(), diff.DBSchemaSource(db.ConnPool),
+		diff.DDLSchemaSource(targetDDL), options...)
+	require.NoError(t, err)
+	assert.Empty(t, plan.Statements)
+	assert.NotEmpty(t, plan.CleanupStatements)
+	publicHash, err := schema.GetSchemaHashWithArchivalPrefix(t.Context(), db.ConnPool, "hash_archive",
+		schema.WithIncludeSchemaPatterns("managed"))
+	require.NoError(t, err)
+	assert.Equal(t, plan.CurrentSchemaHash, publicHash)
 }

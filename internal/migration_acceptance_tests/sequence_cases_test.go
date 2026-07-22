@@ -183,7 +183,8 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -200,7 +201,8 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -541,7 +543,8 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -645,7 +648,8 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
@@ -691,7 +695,8 @@ var sequenceAcceptanceTests = []acceptanceTestCase{
 			`,
 		},
 		expectedHazardTypes: []diff.MigrationHazardType{
-			diff.MigrationHazardTypeDeletesData,
+			diff.MigrationHazardTypeAuthzUpdate,
+			diff.MigrationHazardTypeAcquiresAccessExclusiveLock,
 		},
 	},
 	{
